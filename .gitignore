@@ -1,0 +1,4 @@
+# Session output written while trying the runner; examples/ is kept.
+/*.md
+!/README.md
+/*.jsonl
