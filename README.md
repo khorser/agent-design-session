@@ -91,6 +91,9 @@ timestamped basename. The positional form uses a question file and defaults to
 ```
 
 That writes `my-question-session.md` and `my-question-session.jsonl` next to it.
+Running the same command again does not replace them: a new session refuses
+to start over an existing `.md` or `.jsonl`, even an empty one. Add `--resume`
+to continue that session, or `--force` to replace it.
 Replace `~/src` with the directory containing all checkouts the agents
 need to inspect. `--repo` sets their read-only working directory and the scope
 Claude can read; without it, the runner uses your current directory. Pass it
@@ -165,7 +168,8 @@ seven turns — roughly 5-15 minutes, plus your thinking time between them. The
 runner prints `[turn 3/7] codex reading the repo and thinking...` as it goes
 and rewrites the Markdown file after every turn.
 
-If a turn fails or you interrupt it, everything already written is kept:
+If a turn fails or you interrupt it, everything already written is kept, and
+rerunning without `--resume` is refused rather than starting over:
 
 ```sh
 ./agent-design-session.sh my-question.md sessions/pricing-debate 4 --resume

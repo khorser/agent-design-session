@@ -73,6 +73,32 @@ rm "$work/a.md"
 run --render --out "$work/a" >/dev/null
 [ -s "$work/a.md" ] || fail "render wrote nothing"
 
+echo "==> $runtime: a new session refuses existing outputs"
+sums() { cksum "$work/a.jsonl" "$work/a.md"; }
+before=$(sums)
+if run --topic "Smoke question" --rounds 1 --auto --repo "$root" --out "$work/a" >/dev/null 2>"$work/err"; then
+  fail "a rerun replaced an existing session"
+fi
+grep -q 'a.jsonl already exists.*--force' "$work/err" || fail "unexpected refusal: $(cat "$work/err")"
+[ "$(sums)" = "$before" ] || fail "a refused rerun changed the existing session"
+: > "$work/d.jsonl"
+if run --topic "Empty log" --rounds 1 --auto --repo "$root" --out "$work/d" >/dev/null 2>"$work/err"; then
+  fail "an empty log was replaced"
+fi
+grep -q 'd.jsonl already exists' "$work/err" || fail "unexpected refusal: $(cat "$work/err")"
+[ ! -e "$work/d.md" ] || fail "a refused run wrote a transcript"
+: > "$work/e.md"
+if run --topic "Stray transcript" --rounds 1 --auto --repo "$root" --out "$work/e" >/dev/null 2>"$work/err"; then
+  fail "a stray transcript was replaced"
+fi
+grep -q 'e.md already exists.*--force' "$work/err" || fail "unexpected refusal: $(cat "$work/err")"
+[ ! -e "$work/e.jsonl" ] || fail "a refused run left its log behind"
+run --topic "Forced question" --rounds 1 --auto --repo "$root" --out "$work/e" --force >/dev/null
+grep -q 'Forced question' "$work/e.md" || fail "--force did not replace the transcript"
+if run --resume --force --out "$work/a" --auto --repo "$root" >/dev/null 2>&1; then
+  fail "--force was accepted with --resume"
+fi
+
 echo "==> $runtime: follow-up inherits the designer"
 run --follow-up "$work/a" --topic "Next question" --rounds 1 --auto --repo "$root" --out "$work/b" >/dev/null
 grep -q '^Follows: \[a.md\](a.md)' "$work/b.md" || fail "no Follows link"

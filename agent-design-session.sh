@@ -9,7 +9,7 @@
 # prompted to steer the debate, or ask the last speaker to clarify, between turns.
 #
 # Further arguments pass through to the runner, including --topic, --auto,
-# --resume, --answers FILE, --note FILE and --designer codex|claude.
+# --resume, --force, --answers FILE, --note FILE and --designer codex|claude.
 # Deno is preferred; Node.js 22.18+ is used when Deno is not installed.
 set -eu
 

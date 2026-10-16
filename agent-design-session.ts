@@ -91,7 +91,10 @@ Options:
                           the flag again replaces it for that run.
   --out NAME              Output basename. Writes NAME.md (readable) and
                           NAME.jsonl (log). Default: a timestamped file in the
-                          current directory.
+                          current directory. A new session refuses to replace
+                          either file; use --resume or --force.
+  --force                 Replace an existing NAME.md and NAME.jsonl when
+                          starting a new session.
   --resume                Continue an interrupted or finished session from an
                           existing NAME.jsonl instead of restarting. The
                           question comes from the log, so --topic and
@@ -147,18 +150,19 @@ type Options = {
   note?: string;
   follow_up?: string;
   resume: boolean;
+  force: boolean;
   check: boolean;
   render: boolean;
   auto: boolean;
 };
 
-const FLAGS = new Set(["resume", "check", "render", "auto"]);
+const FLAGS = new Set(["resume", "force", "check", "render", "auto"]);
 const VALUED = new Set([
   "topic", "topic_file", "repo", "rounds", "codex_model", "claude_model", "designer", "out", "answers", "context_file", "note", "follow_up",
 ]);
 
 function parseArgs(argv: string[]): Options {
-  const options: Options = { resume: false, check: false, render: false, auto: false };
+  const options: Options = { resume: false, force: false, check: false, render: false, auto: false };
   for (let i = 0; i < argv.length; i += 1) {
     const option = argv[i];
     if (option === "--help") usage();
@@ -199,6 +203,9 @@ function parseArgs(argv: string[]): Options {
     throw new Error("Provide one of --topic or --topic-file");
   }
   if (options.resume && !options.out) throw new Error("--resume needs --out naming the existing transcript");
+  if (options.resume && options.force) {
+    throw new Error("--force replaces a session; it cannot be combined with --resume");
+  }
   return options;
 }
 
@@ -535,6 +542,28 @@ async function readExisting(jsonl: string): Promise<Entry[]> {
   }
 }
 
+/**
+ * Claim both files of a new session, so a rerun cannot wipe an earlier one.
+ * Exclusive creation refuses an existing file even when it is empty, and two
+ * racing launches cannot both claim it. A failed claim removes only the files
+ * this attempt created; --force truncates instead and has nothing to undo.
+ */
+async function reserve(jsonl: string, markdown: string, force: boolean): Promise<void> {
+  const created: string[] = [];
+  for (const path of [jsonl, markdown]) {
+    try {
+      await writeFile(path, "", { flag: force ? "w" : "wx" });
+      if (!force) created.push(path);
+    } catch (error) {
+      await Promise.all(created.map((file) => rm(file).catch(() => {})));
+      if ((error as { code?: string }).code !== "EEXIST") throw error;
+      throw new Error(path === jsonl
+        ? `${jsonl} already exists. Continue it with --resume, choose another --out, or pass --force to replace it.`
+        : `${markdown} already exists. Choose another --out, or pass --force to replace it.`);
+    }
+  }
+}
+
 /** The absolute basename of the session `base` follows, if any. */
 function parentOf(base: string, start: Entry | undefined): string | undefined {
   const parent = start?.meta?.parent;
@@ -720,9 +749,6 @@ async function main(): Promise<void> {
   const base = basename(options.out ?? defaultBasename());
   const jsonl = `${base}.jsonl`;
   const markdown = `${base}.md`;
-  const scratch = typeof Deno !== "undefined"
-    ? await Deno.makeTempDir({ prefix: "codex-claude-design-" })
-    : await mkdtemp(`${tmpdir()}/codex-claude-design-`);
   const lines = new LineReader();
   let interactive = !options.auto && Boolean(process.stdin.isTTY);
 
@@ -778,12 +804,16 @@ async function main(): Promise<void> {
   };
 
   if (!options.resume) {
-    await writeTextFile(jsonl, "");
+    await reserve(jsonl, markdown, options.force);
     await record("facilitator", `Design session started. Question: ${topic}`, "meta", meta);
   }
   if (answersText) await record("moderator", `Answers to the questions for the human:\n\n${answersText}`, "answers");
   if (noteText) await record("moderator", `Moderator note: ${noteText}`, "note");
 
+  // Created only once the outputs are claimed: cleanup runs on a normal exit only.
+  const scratch = typeof Deno !== "undefined"
+    ? await Deno.makeTempDir({ prefix: "codex-claude-design-" })
+    : await mkdtemp(`${tmpdir()}/codex-claude-design-`);
   const codex = codexAgent(repo, scratch, options.codex_model);
   const claude = claudeAgent(repo, options.claude_model);
   const agents: Record<string, Agent> = { codex, claude };
