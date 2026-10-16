@@ -111,6 +111,20 @@ run --follow-up "$work/a" --topic "Next question" --rounds 1 --auto --repo "$roo
 grep -q '^Follows: \[a.md\](a.md)' "$work/b.md" || fail "no Follows link"
 grep -q 'Claude — proposing architect' "$work/b.md" || fail "designer not inherited"
 
+echo "==> $runtime: reading an unterminated valid log does not change it"
+cp "$work/b.jsonl" "$work/no-newline.jsonl"
+bytes=$(wc -c < "$work/no-newline.jsonl")
+head -c $((bytes - 1)) "$work/no-newline.jsonl" > "$work/no-newline.tmp"
+mv "$work/no-newline.tmp" "$work/no-newline.jsonl"
+before=$(cksum < "$work/no-newline.jsonl")
+run --render --out "$work/no-newline" >/dev/null
+[ "$(cksum < "$work/no-newline.jsonl")" = "$before" ] || fail "render changed a valid log"
+run --follow-up "$work/no-newline" --topic "Child of unterminated log" --rounds 1 --auto --out "$work/no-newline-child" >/dev/null
+[ "$(cksum < "$work/no-newline.jsonl")" = "$before" ] || fail "follow-up changed its parent log"
+run --resume --out "$work/no-newline" --rounds 3 --auto >/dev/null
+run --render --out "$work/no-newline" >/dev/null || fail "a resumed unterminated log is not valid JSONL"
+[ "$(turns "$work/no-newline.jsonl")" -eq 6 ] || fail "resume did not append separate turns"
+
 echo "==> $runtime: a 200 KB context file (over Linux's 128 KiB argument cap)"
 head -c 200000 /dev/zero | tr '\0' 'x' > "$work/context.md"
 : > "$work/prompts.log"

@@ -668,9 +668,17 @@ async function readLog(jsonl: string, recover = false): Promise<Entry[]> {
     console.log(`Moved damaged line ${line.number} of ${jsonl} to ${aside}; ${entries.length} entries remain.`);
     return withKinds(entries);
   }
-  // A last entry without its newline would fuse with the next one appended.
-  if (bytes.length && bytes[bytes.length - 1] !== 0x0a) await appendFile(jsonl, "\n");
   return withKinds(entries);
+}
+
+/**
+ * A complete final JSON value need not have a newline, so readers leave it
+ * alone. Only the active session needs a separator before it appends another
+ * JSONL entry.
+ */
+async function endJsonlLine(jsonl: string): Promise<void> {
+  const bytes = await readFile(jsonl);
+  if (bytes.length && bytes[bytes.length - 1] !== 0x0a) await appendFile(jsonl, "\n");
 }
 
 /**
@@ -995,9 +1003,15 @@ async function main(): Promise<void> {
     return prompt;
   };
 
+  // New logs are empty; only a resumed log may need a separator on its first append.
+  let needsSeparatorCheck = options.resume;
   const record: Recorder = async (speaker, text, kind, entryMeta) => {
     const entry: Entry = { at: new Date().toISOString(), speaker, text, kind, ...(entryMeta ? { meta: entryMeta } : {}) };
     entries.push(entry);
+    if (needsSeparatorCheck) {
+      await endJsonlLine(jsonl);
+      needsSeparatorCheck = false;
+    }
     await appendFile(jsonl, `${JSON.stringify(entry)}\n`);
     await writeTextFile(markdown, markdownDocument(topic, entries));
     sessionStarted = true;
