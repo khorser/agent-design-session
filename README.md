@@ -96,8 +96,13 @@ to start over an existing `.md` or `.jsonl`, even an empty one. Add `--resume`
 to continue that session, or `--force` to replace it.
 Replace `~/src` with the directory containing all checkouts the agents
 need to inspect. `--repo` sets their read-only working directory and the scope
-Claude can read; without it, the runner uses your current directory. Pass it
-again on resume because the session log does not save this setting.
+Claude can read; without it, the runner uses your current directory. The log
+saves it, relative to the log's own directory, so `--resume` and `--follow-up`
+reuse it from wherever you run them. Pass `--repo` on resume only to move the
+session to another checkout: the change is recorded in the transcript, holds
+for later runs, and keeps the existing decision record, whose citations still
+refer to the old tree. `--context-file` on resume is saved the same way, but a
+changed context does rewrite the decision record.
 
 ## The agents can read the repo
 
@@ -180,6 +185,13 @@ session that already ended in a decision record, without raising `--rounds`,
 reopens that record and its menu instead of writing it again. With `--note`
 it writes a new record steered by the note, still without new turns.
 
+A log damaged mid-write, for example by a crash during an append, is refused
+with the number of the bad line. If only the last line is damaged, add
+`--recover` to `--resume`, or to `--render` to repair without running any
+turns: the bad line is moved to `NAME.damaged-TIMESTAMP.jsonl`, never
+discarded, and the session continues from the valid entries. Damage anywhere
+else must be fixed by hand.
+
 ## Answering the questions and continuing
 
 A decision record ends with questions only you can answer. There are two ways
@@ -230,7 +242,8 @@ linked session instead of re-explaining the previous one in the question file:
 Every turn then sees the parent's question, its latest decision record and all
 answers you gave in it (and the same for its own parent, if it was a follow-up
 too). The new transcript starts with a `Follows:` link, the parent path is
-stored relative to the log, and `--designer` defaults to the parent's.
+stored relative to the log, and `--designer`, `--repo` and `--context-file`
+default to the parent's (as last changed on resume).
 `--answers` here records answers to the parent's questions at the start of the
 new session.
 

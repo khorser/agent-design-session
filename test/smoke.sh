@@ -5,7 +5,8 @@
 #
 # The stubs answer every prompt with a canned turn and log how the prompt
 # arrived, so this checks the runner's plumbing (turn order, labels, resume,
-# render, follow-up, stdin prompts, prompt budgets) without calling any model.
+# render, follow-up, stdin prompts, prompt budgets, saved settings, log
+# recovery) without calling any model.
 # Each prompt is saved as prompt-N.txt; SMOKE_PAD=BYTES lengthens every reply.
 set -eu
 
@@ -155,6 +156,71 @@ grep -q 'over the 400000-character ceiling.*--resume --out' "$work/err" || fail 
 [ "$(wc -l < "$work/prompts.log")" -eq 2 ] || fail "expected only the 2 debate calls"
 [ "$(turns "$work/h.jsonl")" -eq 2 ] || fail "expected 2 turns kept"
 ! grep -q '"kind":"decision"' "$work/h.jsonl" || fail "a decision record was written"
+
+echo "==> $runtime: resume reuses the saved repository"
+head -1 "$work/a.jsonl" | grep -q '"repo":"[^/"]' || fail "the log saved no relative repository"
+: > "$work/prompts.log"
+(cd / && run --resume --out "$work/a" --rounds 3 --auto) >/dev/null
+grep -q "^The repository is at $root and" "$work/prompt-1.txt" || fail "resume did not use the saved repository"
+
+echo "==> $runtime: a moved repository is recorded, kept, and keeps the decision record"
+decisions() { grep -c '"kind":"decision"' "$1"; }
+mkdir "$work/alt"
+alt=$(cd "$work/alt" && pwd -P)
+before=$(decisions "$work/a.jsonl")
+: > "$work/prompts.log"
+run --resume --out "$work/a" --repo "$work/alt" --auto >/dev/null
+[ ! -s "$work/prompts.log" ] || fail "a repository move alone rewrote the decision record"
+grep -q '"kind":"meta","meta":{"repo":"alt"}' "$work/a.jsonl" || fail "the move was not logged"
+(cd / && run --resume --out "$work/a" --rounds 4 --auto) >/dev/null
+grep -q "^The repository is at $alt and" "$work/prompt-1.txt" || fail "a later resume forgot the move"
+grep -A1 '^FACILITATOR:' "$work/prompt-1.txt" | grep -q 'Repository changed from' || fail "agents did not see the move"
+
+echo "==> $runtime: a changed context persists and rewrites the decision record"
+echo "NEW-CONTEXT-MARKER" > "$work/ctx.md"
+before=$(decisions "$work/a.jsonl")
+: > "$work/prompts.log"
+run --resume --out "$work/a" --context-file "$work/ctx.md" --auto >/dev/null
+[ "$(wc -l < "$work/prompts.log")" -eq 1 ] || fail "expected one synthesis call"
+[ "$(decisions "$work/a.jsonl")" -eq $((before + 1)) ] || fail "the decision record was reused"
+grep -q 'NEW-CONTEXT-MARKER' "$work/prompt-1.txt" || fail "synthesis did not see the new context"
+
+echo "==> $runtime: a follow-up elsewhere inherits the effective repository and context"
+mkdir "$work/sub"
+: > "$work/prompts.log"
+(cd / && run --follow-up "$work/a" --topic "Child question" --rounds 1 --auto --out "$work/sub/child") >/dev/null
+grep -q "^The repository is at $alt and" "$work/prompt-1.txt" || fail "the child lost the parent's repository"
+grep -q 'NEW-CONTEXT-MARKER' "$work/prompt-1.txt" || fail "the child lost the parent's context"
+head -1 "$work/sub/child.jsonl" | grep -q '"repo":"../alt"' || fail "the child's repository is not relative to its log"
+
+echo "==> $runtime: a damaged last line is recovered only on request"
+cp "$work/b.jsonl" "$work/t.jsonl"
+valid=$(wc -l < "$work/t.jsonl")
+printf '{"at":"20' >> "$work/t.jsonl"
+before=$(cksum < "$work/t.jsonl")
+if run --resume --out "$work/t" --auto >/dev/null 2>"$work/err"; then fail "a damaged log was resumed"; fi
+grep -q "t.jsonl line $((valid + 1)), its last, is malformed.*--recover" "$work/err" || fail "unexpected failure: $(cat "$work/err")"
+[ "$(cksum < "$work/t.jsonl")" = "$before" ] || fail "a refused resume changed the log"
+run --render --recover --out "$work/t" >/dev/null
+[ "$(cat "$work"/t.damaged-*.jsonl)" = '{"at":"20' ] || fail "the damaged bytes were not set aside"
+[ "$(wc -l < "$work/t.jsonl")" -eq "$valid" ] || fail "the valid entries were not kept"
+run --resume --out "$work/t" --auto >/dev/null || fail "the recovered log does not resume"
+
+echo "==> $runtime: interior damage, a missing log and a bad settings update are refused"
+{ head -1 "$work/b.jsonl"; echo 'garbage'; tail -n +2 "$work/b.jsonl"; } > "$work/i.jsonl"
+before=$(cksum < "$work/i.jsonl")
+if run --resume --recover --out "$work/i" --auto >/dev/null 2>"$work/err"; then fail "interior damage was resumed"; fi
+grep -q 'i.jsonl line 2 is malformed' "$work/err" || fail "unexpected failure: $(cat "$work/err")"
+[ "$(cksum < "$work/i.jsonl")" = "$before" ] || fail "--recover changed a log with interior damage"
+if run --resume --out "$work/missing" --auto >/dev/null 2>"$work/err"; then fail "a missing log was resumed"; fi
+grep -q 'missing.jsonl does not exist' "$work/err" || fail "unexpected failure: $(cat "$work/err")"
+{ cat "$work/b.jsonl"
+  echo '{"at":"x","speaker":"facilitator","text":"x","kind":"meta","meta":{"designer":"codex"}}'
+  echo '{"at":"x","speaker":"moderator","text":"x","kind":"note"}'; } > "$work/u.jsonl"
+line=$(($(wc -l < "$work/b.jsonl") + 1))
+if run --resume --out "$work/u" --auto >/dev/null 2>"$work/err"; then fail "a bad settings update was accepted"; fi
+grep -q "u.jsonl line $line is malformed (a settings update cannot set \"designer\"" "$work/err" \
+  || fail "unexpected failure: $(cat "$work/err")"
 
 echo "==> $runtime: launcher --check"
 "$root/agent-design-session.sh" --check >/dev/null

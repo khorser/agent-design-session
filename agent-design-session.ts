@@ -81,6 +81,8 @@ Options:
   --topic-file FILE       Read the design question from FILE instead.
   --repo DIR              Repository both agents may read (default: this
                           directory). They run read-only and cannot edit it.
+                          Saved in the log, so --resume and --follow-up reuse
+                          it; passing it on --resume moves the session there.
   --rounds N              Number of Codex/Claude exchanges (default: 3, max 12).
                           With --resume, the total including earlier rounds;
                           omit it to reopen a finished session's decision
@@ -95,7 +97,8 @@ Options:
   --context-file FILE     Repo-specific background (for example the paths both
                           agents may read), given to every turn. Saved in the
                           log, so --resume and --follow-up inherit it; passing
-                          the flag again replaces it for that run.
+                          it on --resume replaces it for later runs too, and
+                          a finished session's decision record is rewritten.
   --out NAME              Output basename. Writes NAME.md (readable) and
                           NAME.jsonl (log). Default: a timestamped file in the
                           current directory. A new session refuses to replace
@@ -111,6 +114,10 @@ Options:
                           the existing record is shown with its menu. A new
                           record is written only if the last one is missing,
                           superseded, or followed by --note.
+  --recover               With --resume or --render: if the log's last line was
+                          cut short by an interrupted write, move it to
+                          NAME.damaged-TIMESTAMP.jsonl and keep the rest.
+                          Damage anywhere else is refused.
   --answers FILE          Record FILE as the human's answers to the previous
                           decision record's questions before the next turn.
   --note FILE             Record FILE as a moderator note steering the next
@@ -158,18 +165,19 @@ type Options = {
   follow_up?: string;
   resume: boolean;
   force: boolean;
+  recover: boolean;
   check: boolean;
   render: boolean;
   auto: boolean;
 };
 
-const FLAGS = new Set(["resume", "force", "check", "render", "auto"]);
+const FLAGS = new Set(["resume", "force", "recover", "check", "render", "auto"]);
 const VALUED = new Set([
   "topic", "topic_file", "repo", "rounds", "codex_model", "claude_model", "designer", "out", "answers", "context_file", "note", "follow_up",
 ]);
 
 function parseArgs(argv: string[]): Options {
-  const options: Options = { resume: false, force: false, check: false, render: false, auto: false };
+  const options: Options = { resume: false, force: false, recover: false, check: false, render: false, auto: false };
   for (let i = 0; i < argv.length; i += 1) {
     const option = argv[i];
     if (option === "--help") usage();
@@ -210,6 +218,9 @@ function parseArgs(argv: string[]): Options {
     throw new Error("Provide one of --topic or --topic-file");
   }
   if (options.resume && !options.out) throw new Error("--resume needs --out naming the existing transcript");
+  if (options.recover && !options.resume) {
+    throw new Error("--recover repairs an existing log; combine it with --resume or --render");
+  }
   if (options.resume && options.force) {
     throw new Error("--force replaces a session; it cannot be combined with --resume");
   }
@@ -222,10 +233,31 @@ function parseArgs(argv: string[]): Options {
  * replies to a decision record's questions. Logs written before `kind` existed
  * have none, so `kindOf` infers it from the speaker.
  */
+const KINDS = new Set(["meta", "turn", "note", "clarify-question", "clarification", "answers", "decision"]);
 type Kind = "meta" | "turn" | "note" | "clarify-question" | "clarification" | "answers" | "decision";
+/**
+ * The settings a resumed run may change. Each change is a later `meta` entry
+ * carrying only the changed keys; `settingsOf` folds them over the first.
+ * `repo` is the repository directory, relative to this log's directory.
+ */
+type Settings = { repo?: string; context?: string };
 /** `parent` is the parent session's basename, relative to this log's directory. */
-type Meta = { designer: string; parent?: string; context?: string };
-type Entry = { at: string; speaker: string; text: string; kind?: Kind; meta?: Meta };
+type Meta = Settings & { designer: string; parent?: string };
+type Entry = { at: string; speaker: string; text: string; kind?: Kind; meta?: Meta | Settings };
+
+/** The settings the session started with; `readLog` has checked their shape. */
+const startMeta = (entries: Entry[]) => entries[0]?.meta as Meta | undefined;
+
+/** The settings in effect after every update. `designer` and `parent` never change. */
+function settingsOf(entries: Entry[]): Settings {
+  const settings: Settings = { repo: startMeta(entries)?.repo, context: startMeta(entries)?.context };
+  for (const entry of entries.slice(1)) {
+    if (entry.kind !== "meta" || !entry.meta) continue;
+    if (entry.meta.repo !== undefined) settings.repo = entry.meta.repo;
+    if (entry.meta.context !== undefined) settings.context = entry.meta.context;
+  }
+  return settings;
+}
 
 function kindOf(entry: Entry, index: number): Kind {
   if (entry.kind) return entry.kind;
@@ -270,14 +302,19 @@ function absolute(path: string): string {
   return `/${parts.join("/")}`;
 }
 
-/** Path of `to` as a link from a document stored at `from`. */
-function relative(from: string, to: string): string {
-  const fromDirs = absolute(from).split("/").slice(1, -1);
-  const toParts = absolute(to).split("/").slice(1);
+const dirOf = (path: string) => absolute(path).split("/").slice(0, -1).join("/") || "/";
+
+/** Path of `to` as seen from the directory `from`; `.` when they are the same. */
+function relativeDir(from: string, to: string): string {
+  const fromDirs = absolute(from).split("/").filter(Boolean);
+  const toParts = absolute(to).split("/").filter(Boolean);
   let shared = 0;
-  while (shared < fromDirs.length && shared < toParts.length - 1 && fromDirs[shared] === toParts[shared]) shared += 1;
-  return [...fromDirs.slice(shared).map(() => ".."), ...toParts.slice(shared)].join("/");
+  while (shared < fromDirs.length && shared < toParts.length && fromDirs[shared] === toParts[shared]) shared += 1;
+  return [...fromDirs.slice(shared).map(() => ".."), ...toParts.slice(shared)].join("/") || ".";
 }
+
+/** Path of `to` as a link from a document stored at `from`. */
+const relative = (from: string, to: string) => relativeDir(dirOf(from), to);
 
 const capitalize = (name: string) => name[0].toUpperCase() + name.slice(1);
 
@@ -314,7 +351,8 @@ function pinnedIndices(entries: Entry[]): Set<number> {
  */
 function transcriptForPrompt(entries: Entry[], budget: number): { text: string; omitted: number[] } {
   const pinned = pinnedIndices(entries);
-  let kept = entries.flatMap((entry, i) => entry.kind === "meta" || pinned.has(i) ? [] : [i]);
+  // Only the opening entry is hidden; later settings changes are history the agents should see.
+  let kept = entries.flatMap((_, i) => i === 0 || pinned.has(i) ? [] : [i]);
   const render = (indices: number[]) => indices.map((i) => `${promptLabel(entries[i])}:\n${entries[i].text}`).join("\n\n");
   const omitted: number[] = [];
   let text = render(kept);
@@ -444,7 +482,7 @@ function entryTitle(entries: Entry[], index: number): string {
   switch (entry.kind) {
     case "turn": {
       // Logs from before the designer was saved had codex propose.
-      const designer = entries[0]?.meta?.designer ?? "codex";
+      const designer = startMeta(entries)?.designer ?? "codex";
       return `${capitalize(entry.speaker)} — ${entry.speaker === designer ? "proposing architect" : "skeptical reviewer"}`;
     }
     case "clarification":
@@ -480,7 +518,7 @@ function questionSection(topic: string): string {
 
 /** Both files of a session share a directory, so the stored parent path is already a valid link. */
 function markdownDocument(topic: string, entries: Entry[]): string {
-  const parent = entries[0]?.meta?.parent;
+  const parent = startMeta(entries)?.parent;
   const follows = parent ? `Follows: [${parent.split("/").at(-1)}.md](${parent}.md)\n\n` : "";
   const head = `# Design session\n\n${follows}${questionSection(topic)}\n\n---\n`;
   const body = entries
@@ -553,13 +591,86 @@ async function checkPrerequisites(): Promise<boolean> {
   return ok;
 }
 
-async function readExisting(jsonl: string): Promise<Entry[]> {
-  try {
-    const text = await readTextFile(jsonl);
-    return withKinds(text.split("\n").filter(Boolean).map((line) => JSON.parse(line) as Entry));
-  } catch {
-    return [];
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** Why a parsed log line is not a usable entry, or undefined if it is. */
+function entryProblem(value: unknown, index: number): string | undefined {
+  if (!isObject(value)) return "not a JSON object";
+  for (const field of ["at", "speaker", "text"]) {
+    if (typeof value[field] !== "string") return `"${field}" is not a string`;
   }
+  if (value.kind !== undefined && !KINDS.has(value.kind as string)) return `unknown kind ${JSON.stringify(value.kind)}`;
+  const meta = value.meta;
+  if (index === 0) {
+    if (value.kind !== undefined && value.kind !== "meta") return "the first entry is not the session's settings";
+    if (meta === undefined) return undefined;
+    if (!isObject(meta) || typeof meta.designer !== "string") return "the session's settings have no designer";
+    const bad = ["parent", "context", "repo"].find((key) => meta[key] !== undefined && typeof meta[key] !== "string");
+    return bad && `setting "${bad}" is not a string`;
+  }
+  if (value.kind !== "meta") return undefined;
+  if (!isObject(meta) || !Object.keys(meta).length) return "a settings update changes nothing";
+  const bad = Object.entries(meta).find(([key, setting]) => !(key === "repo" || key === "context") || typeof setting !== "string");
+  return bad && `a settings update cannot set "${bad[0]}" to ${JSON.stringify(bad[1])}`;
+}
+
+/**
+ * The entries of a session log. A missing log and a damaged one are reported
+ * apart, by physical line number. Only a damaged last line, the trace of an
+ * interrupted append, can be recovered, and only with `recover`: its bytes are
+ * moved to a side file, never discarded, and the log keeps the valid lines.
+ */
+async function readLog(jsonl: string, recover = false): Promise<Entry[]> {
+  let bytes: Uint8Array;
+  try {
+    bytes = await readFile(jsonl);
+  } catch (error) {
+    if ((error as { code?: string }).code === "ENOENT") throw new Error(`${jsonl} does not exist`);
+    throw error;
+  }
+  const lines: { number: number; start: number; text: string }[] = [];
+  for (let start = 0, number = 1; start < bytes.length; number += 1) {
+    const newline = bytes.indexOf(0x0a, start);
+    const end = newline < 0 ? bytes.length : newline;
+    const text = decoder.decode(bytes.subarray(start, end));
+    if (text.trim()) lines.push({ number, start, text });
+    start = end + 1;
+  }
+  const entries: Entry[] = [];
+  for (const [index, line] of lines.entries()) {
+    let problem: string | undefined;
+    try {
+      const value: unknown = JSON.parse(line.text);
+      problem = entryProblem(value, index);
+      if (!problem) entries.push(value as Entry);
+    } catch {
+      problem = "incomplete or invalid JSON";
+    }
+    if (!problem) continue;
+    const base = basename(jsonl);
+    if (index === 0) {
+      throw new Error(`${jsonl} line ${line.number}, the session's first entry, is malformed (${problem}); `
+        + "without it there is no session to recover.");
+    }
+    if (index < lines.length - 1) {
+      throw new Error(`${jsonl} line ${line.number} is malformed (${problem}). Only a damaged last line can be `
+        + "recovered; fix or remove this one by hand.");
+    }
+    if (!recover) {
+      throw new Error(`${jsonl} line ${line.number}, its last, is malformed (${problem}), probably from an interrupted `
+        + `write. Set it aside and keep the ${entries.length} valid entries with --resume --recover --out ${base}, or `
+        + `with --render --recover --out ${base} to repair the log without running any turns.`);
+    }
+    const aside = `${base}.damaged-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}.jsonl`;
+    await writeFile(aside, bytes.subarray(line.start), { flag: "wx" });
+    await writeFile(jsonl, bytes.subarray(0, line.start));
+    console.log(`Moved damaged line ${line.number} of ${jsonl} to ${aside}; ${entries.length} entries remain.`);
+    return withKinds(entries);
+  }
+  // A last entry without its newline would fuse with the next one appended.
+  if (bytes.length && bytes[bytes.length - 1] !== 0x0a) await appendFile(jsonl, "\n");
+  return withKinds(entries);
 }
 
 /**
@@ -585,9 +696,19 @@ async function reserve(jsonl: string, markdown: string, force: boolean): Promise
 }
 
 /** The absolute basename of the session `base` follows, if any. */
-function parentOf(base: string, start: Entry | undefined): string | undefined {
-  const parent = start?.meta?.parent;
-  return parent && absolute(`${absolute(base).split("/").slice(0, -1).join("/")}/${parent}`);
+function parentOf(base: string, entries: Entry[]): string | undefined {
+  const parent = startMeta(entries)?.parent;
+  return parent && absolute(`${dirOf(base)}/${parent}`);
+}
+
+/** A repository path saved in `jsonl`, resolved against that log's directory. */
+async function resolveRepo(jsonl: string, saved: string): Promise<{ path: string; exists: boolean }> {
+  const path = absolute(`${await realpath(dirOf(jsonl))}/${saved}`);
+  try {
+    return { path: await realpath(path), exists: true };
+  } catch {
+    return { path, exists: false };
+  }
 }
 
 const questionOf = (start: Entry) =>start.text.replace(/^Design session started\. Question: /, "");
@@ -599,9 +720,9 @@ const questionOf = (start: Entry) =>start.text.replace(/^Design session started\
 async function parentContext(parent: string | undefined, seen = new Set<string>()): Promise<string> {
   if (!parent || seen.has(parent)) return "";
   seen.add(parent);
-  const entries = await readExisting(`${parent}.jsonl`);
+  const entries = await readLog(`${parent}.jsonl`);
   if (!entries.length) throw new Error(`No turns found in ${parent}.jsonl`);
-  const ancestors = await parentContext(parentOf(parent, entries[0]), seen);
+  const ancestors = await parentContext(parentOf(parent, entries), seen);
   const lastDecision = entries.findLastIndex((entry) => entry.kind === "decision");
   const answers = entries.filter((entry) => entry.kind === "answers");
   const own = [
@@ -652,7 +773,7 @@ class LineReader {
   }
 }
 
-type Recorder = (speaker: string, text: string, kind: Kind, meta?: Meta) => Promise<void>;
+type Recorder = (speaker: string, text: string, kind: Kind, meta?: Meta | Settings) => Promise<void>;
 
 type Steer =
   | { steer: "continue" | "synthesize" | "more" | "quit" | "unattended" }
@@ -747,7 +868,7 @@ async function main(): Promise<void> {
 
   if (options.render) {
     const base = basename(options.out!);
-    const existing = await readExisting(`${base}.jsonl`);
+    const existing = await readLog(`${base}.jsonl`, options.recover);
     if (!existing.length) throw new Error(`No turns found in ${base}.jsonl`);
     await writeTextFile(`${base}.md`, markdownDocument(questionOf(existing[0]), existing));
     console.log(`Wrote ${base}.md from ${existing.length} turns.`);
@@ -765,7 +886,6 @@ async function main(): Promise<void> {
   const noteText = options.note ? (await readTextFile(options.note)).trim() : undefined;
   if (options.note && !noteText) throw new Error(`${options.note} is empty`);
 
-  const repo = await realpath(options.repo ?? process.cwd());
   const base = basename(options.out ?? defaultBasename());
   const jsonl = `${base}.jsonl`;
   const markdown = `${base}.md`;
@@ -776,10 +896,13 @@ async function main(): Promise<void> {
   let topic: string;
   let meta: Meta;
   let parent: string | undefined;
-  let context: string;
+  // The settings this run starts from, and the log that saved them: a new
+  // follow-up starts from its parent's.
+  let saved: Settings = {};
+  let savedIn = jsonl;
   const followUp = options.follow_up ? absolute(basename(options.follow_up)) : undefined;
   if (options.resume) {
-    entries = await readExisting(jsonl);
+    entries = await readLog(jsonl, options.recover);
     if (!entries.length) throw new Error(`--resume found no previous turns in ${jsonl}`);
     // The log is the record of what was asked; a changed question file must not rewrite it.
     topic = questionOf(entries[0]);
@@ -787,12 +910,12 @@ async function main(): Promise<void> {
       throw new Error("This session's question is fixed; use --note to steer it or --follow-up for a new question");
     }
     // Logs from before settings were saved carry no meta; fall back to the flags.
-    meta = entries[0].meta ?? { designer: options.designer ?? "codex" };
-    context = contextText ?? meta.context ?? "";
+    meta = startMeta(entries) ?? { designer: options.designer ?? "codex" };
+    saved = settingsOf(entries);
     if (options.designer && options.designer !== meta.designer) {
       throw new Error(`This session was started with --designer ${meta.designer}`);
     }
-    parent = parentOf(base, entries[0]);
+    parent = parentOf(base, entries);
     if (followUp && followUp !== parent) {
       throw new Error("--follow-up cannot be added to a session on --resume; start a new session instead");
     }
@@ -801,16 +924,50 @@ async function main(): Promise<void> {
     console.log(`Resuming ${jsonl} with ${entries.length} existing turns.`);
   } else {
     topic = given!;
-    const parentEntries = followUp ? await readExisting(`${followUp}.jsonl`) : [];
+    const parentEntries = followUp ? await readLog(`${followUp}.jsonl`) : [];
     if (followUp && !parentEntries.length) throw new Error(`--follow-up found no turns in ${followUp}.jsonl`);
     parent = followUp;
-    context = contextText ?? parentEntries[0]?.meta?.context ?? "";
-    // Stored relative, so a committed log does not carry this machine's paths.
+    saved = settingsOf(parentEntries);
+    if (followUp) savedIn = `${followUp}.jsonl`;
+    meta = { designer: options.designer ?? startMeta(parentEntries)?.designer ?? "codex" };
+  }
+  const context = contextText ?? saved.context ?? "";
+
+  // Paths are stored relative to the log, so a committed log does not carry
+  // this machine's paths. Both ends are resolved through symlinks first:
+  // `..` in a path written from /var/x means something else from /private/var/x.
+  const logDir = await realpath(dirOf(jsonl));
+  const savedRepo = saved.repo === undefined ? undefined : await resolveRepo(savedIn, saved.repo);
+  if (!options.repo && savedRepo && !savedRepo.exists) {
+    throw new Error(`${savedIn} saved the repository as ${saved.repo}, which resolves to ${savedRepo.path} and no `
+      + "longer exists. Pass --repo DIR to point the session at the checkout.");
+  }
+  const repo = await realpath(options.repo ?? savedRepo?.path ?? process.cwd());
+  const repoInLog = relativeDir(logDir, repo);
+  const updates: [string, Settings][] = [];
+  if (!options.resume) {
     meta = {
-      designer: options.designer ?? parentEntries[0]?.meta?.designer ?? "codex",
+      ...meta,
       ...(followUp ? { parent: relative(jsonl, followUp) } : {}),
+      repo: repoInLog,
       ...(context ? { context } : {}),
     };
+  } else {
+    // Each change is recorded where the agents can see it, and holds for later runs.
+    if (!savedRepo) updates.push([`Repository recorded as ${repoInLog} (relative to this log).`, { repo: repoInLog }]);
+    else if (savedRepo.path !== repo) {
+      updates.push([
+        `Repository changed from ${saved.repo} to ${repoInLog} (relative to this log); entries before this one `
+          + "cite the earlier tree.",
+        { repo: repoInLog },
+      ]);
+    }
+    if (contextText !== undefined && contextText !== (saved.context ?? "")) {
+      updates.push([
+        `Repository context ${saved.context ? "replaced" : "set"} for this and later runs (${contextText.length} characters).`,
+        { context: contextText },
+      ]);
+    }
   }
   // Read once: a parent is finished and not written to by this session.
   const inherited = await parentContext(parent);
@@ -855,6 +1012,7 @@ async function main(): Promise<void> {
     await reserve(jsonl, markdown, options.force);
     await record("facilitator", `Design session started. Question: ${topic}`, "meta", meta);
   }
+  for (const [text, settings] of updates) await record("facilitator", text, "meta", settings);
   if (answersText) await record("moderator", `Answers to the questions for the human:\n\n${answersText}`, "answers");
   if (noteText) await record("moderator", `Moderator note: ${noteText}`, "note");
 
@@ -872,13 +1030,20 @@ async function main(): Promise<void> {
   const spoken = () => entries.filter((entry) => entry.kind === "turn").length;
   // Resuming a finished session adds turns only when --rounds asks for more, even
   // after a record written mid-round by [s]. Its record is reopened rather than
-  // written again, unless a note since is addressed to it; answers and
-  // clarifications are not, as in a session neither rewrites the record.
+  // written again, unless a note since is addressed to it or the context it was
+  // written with has changed; answers and clarifications are not, as in a
+  // session neither rewrites the record. A moved repository changes no argument.
   const standing = options.resume ? standingDecision(entries) : undefined;
   let finished = standing !== undefined && (options.rounds ?? 0) * 2 <= spoken();
-  let kept = finished && !entries.slice(standing! + 1).some(({ kind }) => kind === "note")
+  const then = standing === undefined ? {} : settingsOf(entries.slice(0, standing + 1));
+  const now = settingsOf(entries);
+  let kept = finished && then.context === now.context
+      && !entries.slice(standing! + 1).some(({ kind }) => kind === "note")
     ? entries[standing!].text
     : undefined;
+  if (kept !== undefined && then.repo !== undefined && then.repo !== now.repo) {
+    console.log(`The repository moved after this decision record was written; its citations refer to ${then.repo} (relative to the log).\n`);
+  }
   let rounds = Math.max(options.rounds ?? 3, Math.ceil(spoken() / 2));
   const startedAt = Date.now();
 
