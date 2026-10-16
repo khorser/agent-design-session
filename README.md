@@ -52,10 +52,10 @@ Put the question and a separate note in files:
 
 `question.md` holds the design prompt. `note.md` holds additional human guidance,
 such as the repository layout, relevant paths, constraints or priorities. The
-runner records it as a moderator note before the first turn. For static background
-that must appear in **every** turn and carry into resumed or follow-up sessions,
-use `--context-file repo-layout.md`; a note can leave the prompt when an older
-part of the transcript is trimmed.
+runner records it as a moderator note before the first turn. Notes are never
+trimmed from the prompt, but they belong to this session only. For static
+background that must also carry into resumed runs and follow-up sessions, use
+`--context-file repo-layout.md`.
 
 `--out foo-codex` creates **two files**: `foo-codex.md`, the readable transcript
 and decision record, and `foo-codex.jsonl`, the log used for resume and render.
@@ -185,9 +185,13 @@ it writes a new record steered by the note, still without new turns.
 A decision record ends with questions only you can answer. There are two ways
 to answer them and keep going; in both, your answers and the record they
 answer are **pinned**: every later prompt carries them in full, outside the
-part of the transcript that is trimmed from the front when it grows past the
-prompt budget. Agents are told to treat answers as decisions and to reopen one
+transcript. Agents are told to treat answers as decisions and to reopen one
 only with evidence from the code.
+
+The transcript itself is trimmed for debate turns once it passes about 28,000
+characters. Whole entries drop out, oldest first, and the prompt lists their
+numbers as they appear in the Markdown file. Moderator notes and the latest
+entry are always kept. The decision record is written from the full debate.
 
 **Same discussion, more rounds.** Answer with `a` at the end of the run and
 pick `m`, or come back later. Put the answers in a file (free-form Markdown)
@@ -231,8 +235,12 @@ stored relative to the log, and `--designer` defaults to the parent's.
 new session.
 
 Pinned context is not trimmed, so a long chain of follow-ups carries every
-ancestor's decision record in each prompt. For a few records that is fine; for a deep chain, fold the settled points into the new question file
-and start a fresh session instead.
+ancestor's decision record in each prompt. For a few records that is fine. No
+prompt may exceed 400,000 characters (about 100k tokens), counting the
+question, `--context-file`, pinned records and transcript. A session that would
+go over stops with a message naming the sizes instead of sending the prompt.
+For a deep chain, fold the settled points into the new question file and start
+a fresh session instead.
 
 ## The decision record
 

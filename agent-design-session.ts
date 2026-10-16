@@ -18,7 +18,14 @@ import { tmpdir } from "node:os";
  * --auto is given. Two files are written side by side: a JSONL log for tooling
  * and a Markdown transcript for reading.
  */
+/** Debate turns see at most this much transcript; whole entries drop out oldest first. */
 const MAX_TRANSCRIPT_CHARS = 28_000;
+/**
+ * No prompt may be longer, about 100k tokens, which leaves the agent room to
+ * read the repository. It counts everything: the question, context, settled
+ * records and the transcript.
+ */
+const MAX_PROMPT_CHARS = 400_000;
 /** Set once a turn has been written, so failures know whether --resume is useful. */
 let sessionStarted = false;
 const decoder = new TextDecoder();
@@ -281,8 +288,8 @@ function promptLabel(entry: Entry): string {
 
 /**
  * The human's answers, and the decision record each one answers, are what a
- * later turn must never lose. They are pinned: shown in full, outside the part
- * of the transcript that is cut from the front when it grows too long.
+ * later turn must never lose. They are pinned: shown in full, outside the
+ * transcript, which loses its oldest entries when it grows too long.
  */
 function pinnedIndices(entries: Entry[]): Set<number> {
   const pinned = new Set<number>();
@@ -299,15 +306,28 @@ function pinnedIndices(entries: Entry[]): Set<number> {
   return pinned;
 }
 
-function transcriptForPrompt(entries: Entry[]): string {
+/**
+ * The debate as a prompt shows it. Over `budget`, whole entries are dropped
+ * oldest first and listed by the number they have in the Markdown transcript,
+ * so a prompt never starts mid-entry. Moderator notes are instructions and are
+ * always kept, as is the latest entry, which is what the next turn answers.
+ */
+function transcriptForPrompt(entries: Entry[], budget: number): { text: string; omitted: number[] } {
   const pinned = pinnedIndices(entries);
-  const rendered = entries
-    .filter((entry, i) => entry.kind !== "meta" && !pinned.has(i))
-    .map((entry) => `${promptLabel(entry)}:\n${entry.text}`)
-    .join("\n\n");
-  return rendered.length <= MAX_TRANSCRIPT_CHARS
-    ? rendered
-    : `[Earlier turns omitted for size.]\n\n${rendered.slice(-MAX_TRANSCRIPT_CHARS)}`;
+  let kept = entries.flatMap((entry, i) => entry.kind === "meta" || pinned.has(i) ? [] : [i]);
+  const render = (indices: number[]) => indices.map((i) => `${promptLabel(entries[i])}:\n${entries[i].text}`).join("\n\n");
+  const omitted: number[] = [];
+  let text = render(kept);
+  while (text.length > budget) {
+    const drop = kept.findIndex((i, k) => entries[i].kind !== "note" && k < kept.length - 1);
+    if (drop < 0) break;
+    omitted.push(kept[drop]);
+    kept = kept.filter((_, k) => k !== drop);
+    const listed = omitted.map((i) => `${i} ${promptLabel(entries[i])}`).join(", ");
+    text = `[Omitted for size: ${listed}. Numbers match the Markdown transcript; moderator notes are always kept.]`
+      + `\n\n${render(kept)}`;
+  }
+  return { text, omitted };
 }
 
 function pinnedForPrompt(parentContext: string, entries: Entry[]): string {
@@ -794,6 +814,29 @@ async function main(): Promise<void> {
   }
   // Read once: a parent is finished and not written to by this session.
   const inherited = await parentContext(parent);
+  const pinned = () => pinnedForPrompt(inherited, entries);
+
+  const overCeiling = (size: number) => new Error(
+    `A prompt would be ${size} characters, over the ${MAX_PROMPT_CHARS}-character ceiling (question `
+      + `${topic.length}, context ${context.length}, settled records ${pinned().length}; the rest is the transcript). `
+      + (sessionStarted ? `Rerun with --resume --out ${base} --context-file SHORTER.md` : "Pass a shorter --context-file")
+      + ", or fold a long --follow-up chain's settled points into a fresh question. Moderator notes, and the "
+      + "debate given to the decision record, are never trimmed; compaction is not implemented.",
+  );
+  /**
+   * Everything but the transcript is required, so a prompt over the ceiling
+   * stops the session rather than reach an agent that cannot hold it. `window`
+   * caps the transcript further for turns; synthesis passes Infinity, so the
+   * decision record is written from the whole debate or not at all.
+   */
+  const fitPrompt = (build: (transcript: string) => string, window: number): string => {
+    const room = MAX_PROMPT_CHARS - build("").length;
+    const { text, omitted } = transcriptForPrompt(entries, window === Infinity ? Infinity : Math.min(window, room));
+    const prompt = build(text);
+    if (prompt.length > MAX_PROMPT_CHARS) throw overCeiling(prompt.length);
+    if (omitted.length) console.log(`  (prompt omits entries ${omitted.join(", ")} for size)`);
+    return prompt;
+  };
 
   const record: Recorder = async (speaker, text, kind, entryMeta) => {
     const entry: Entry = { at: new Date().toISOString(), speaker, text, kind, ...(entryMeta ? { meta: entryMeta } : {}) };
@@ -802,6 +845,11 @@ async function main(): Promise<void> {
     await writeTextFile(markdown, markdownDocument(topic, entries));
     sessionStarted = true;
   };
+
+  // Checked before the outputs are claimed, so an oversized context leaves no session behind.
+  const settled = [pinned(), answersText, noteText].filter(Boolean).join("\n\n");
+  const fixed = agentPrompt("", topic, settled, "", repo, context).length;
+  if (fixed > MAX_PROMPT_CHARS) throw overCeiling(fixed);
 
   if (!options.resume) {
     await reserve(jsonl, markdown, options.force);
@@ -833,7 +881,6 @@ async function main(): Promise<void> {
     : undefined;
   let rounds = Math.max(options.rounds ?? 3, Math.ceil(spoken() / 2));
   const startedAt = Date.now();
-  const pinned = () => pinnedForPrompt(inherited, entries);
 
   console.log(`Repository: ${repo} (read-only)`);
   if (parent) console.log(`Follows:    ${parent}.md`);
@@ -844,7 +891,9 @@ async function main(): Promise<void> {
   const clarify = async (speaker: string, question: string): Promise<void> => {
     await record("moderator", `Moderator question to ${capitalize(speaker)}: ${question}`, "clarify-question");
     console.log(`[clarification] ${speaker} reading the repo and thinking...`);
-    const text = await agents[speaker](clarifyPrompt(speaker, topic, pinned(), transcriptForPrompt(entries), question, repo, context));
+    const text = await agents[speaker](
+      fitPrompt((transcript) => clarifyPrompt(speaker, topic, pinned(), transcript, question, repo, context), MAX_TRANSCRIPT_CHARS),
+    );
     await record(speaker, text, "clarification");
     console.log(`[clarification] ${speaker} done (${minutes(startedAt)} elapsed)\n\n${text}\n`);
   };
@@ -862,9 +911,10 @@ async function main(): Promise<void> {
       const role = speaker === designer ? "the proposing architect" : "the skeptical design reviewer";
       const label = `[turn ${turn + 1}/${rounds * 2 + 1}] ${speaker}`;
       console.log(`${label} reading the repo and thinking...`);
-      const text = await agents[speaker](
-        agentPrompt(`${capitalize(speaker)}, ${role}`, topic, pinned(), transcriptForPrompt(entries), repo, context),
-      );
+      const text = await agents[speaker](fitPrompt(
+        (transcript) => agentPrompt(`${capitalize(speaker)}, ${role}`, topic, pinned(), transcript, repo, context),
+        MAX_TRANSCRIPT_CHARS,
+      ));
       await record(speaker, text, "turn");
       console.log(`${label} done (${minutes(startedAt)} elapsed)\n\n${text}\n`);
       if (!interactive) continue;
@@ -898,7 +948,9 @@ async function main(): Promise<void> {
       console.log("=== decision record (already written) ===");
     } else {
       console.log("=== decision record ===");
-      decision = await agents[reviewer](synthesisPrompt(topic, pinned(), transcriptForPrompt(entries), context));
+      decision = await agents[reviewer](
+        fitPrompt((transcript) => synthesisPrompt(topic, pinned(), transcript, context), Infinity),
+      );
       await record("facilitator", decision, "decision");
     }
     console.log(`${decision}\n`);
